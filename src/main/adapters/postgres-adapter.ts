@@ -37,7 +37,10 @@ function reasonOf(error: unknown): string {
 /** Shared across profiles; the manager keys tunnels by profile id internally. */
 const sharedTunnels = new TeleportTunnelManager()
 
-type TunnelManager = Pick<TeleportTunnelManager, 'start' | 'stop' | 'stopAll'>
+type TunnelManager = Pick<
+  TeleportTunnelManager,
+  'start' | 'stop' | 'stopAll' | 'reconnect' | 'state'
+>
 
 /**
  * Test runs against a throwaway tunnel key so it never disturbs a live
@@ -180,6 +183,15 @@ export class PostgresAdapter implements DataSourceAdapter {
     listener: Parameters<typeof onPostgresStateChanged>[0],
   ): void {
     onPostgresStateChanged(listener)
+  }
+
+  /** True when keepalive detected the drop and the tunnel awaits a user-confirmed reconnect. */
+  tunnelLost(profileId: string): boolean {
+    return this.tunnels.state(profileId) === 'lost'
+  }
+
+  async reconnectTunnel(profileId: string): Promise<void> {
+    await this.tunnels.reconnect(profileId)
   }
 
   async cancelConnect(profileId: string): Promise<void> {

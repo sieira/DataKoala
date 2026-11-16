@@ -6,17 +6,30 @@ import { PostgresAdapter, testTunnelKey } from './postgres-adapter.ts'
 class FakeTunnels {
   starts: string[] = []
   stops: Array<{ id: string; generation?: number }> = []
+  lost: Set<string> = new Set()
+  reconnects: string[] = []
 
   async start(id: string): Promise<number> {
     this.starts.push(id)
+    this.lost.delete(id)
     return 42
   }
 
   async stop(id: string, generation?: number): Promise<void> {
     this.stops.push({ id, generation })
+    this.lost.delete(id)
   }
 
   async stopAll(): Promise<void> {}
+
+  state(id: string): 'lost' | undefined {
+    return this.lost.has(id) ? 'lost' : undefined
+  }
+
+  async reconnect(id: string): Promise<void> {
+    this.reconnects.push(id)
+    this.lost.delete(id)
+  }
 }
 
 function profile(overrides: Partial<PostgresProfile> = {}): PostgresProfile {
@@ -63,4 +76,17 @@ test('test without a tunnel never touches the tunnel manager', async () => {
 
   assert.equal(tunnels.starts.length, 0)
   assert.equal(tunnels.stops.length, 0)
+})
+
+test('tunnelLost and reconnectTunnel delegate to the manager state', async () => {
+  const tunnels = new FakeTunnels()
+  const adapter = new PostgresAdapter(tunnels)
+
+  assert.equal(adapter.tunnelLost('p1'), false)
+  tunnels.lost.add('p1')
+  assert.equal(adapter.tunnelLost('p1'), true)
+
+  await adapter.reconnectTunnel('p1')
+  assert.deepEqual(tunnels.reconnects, ['p1'])
+  assert.equal(adapter.tunnelLost('p1'), false)
 })

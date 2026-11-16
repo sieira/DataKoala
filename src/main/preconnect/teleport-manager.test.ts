@@ -96,11 +96,8 @@ function harness(overrides: Partial<TeleportDeps> = {}): Harness {
     },
     waitForPort: async () => {},
     probePort: async () => true,
-    restartBaseDelayMs: 1,
-    restartMaxDelayMs: 1,
     healthIntervalMs: 1000,
     healthFailureThreshold: 2,
-    maxRestarts: 5,
     killGraceMs: 5,
     ...overrides,
   })
@@ -202,7 +199,7 @@ test('a tunnel that exits before the port opens fails the start', async () => {
   assert.equal(manager.isReady('p1'), false)
 })
 
-test('keepalive restarts the tunnel after an unexpected exit', async () => {
+test('keepalive marks the tunnel lost after an unexpected exit and reconnect restores it', async () => {
   const { manager, children, events } = harness()
   await manager.start('p1', config())
   assert.equal(children.length, 1)
@@ -210,10 +207,51 @@ test('keepalive restarts the tunnel after an unexpected exit', async () => {
   children[0].emitExit(1, null)
   await wait(30)
 
+  // No background respawn: the tunnel waits for an explicit reconnect.
+  assert.equal(children.length, 1)
+  assert.equal(manager.state('p1'), 'lost')
+  assert.ok(events.some((event) => event.state === 'lost'))
+
+  await manager.reconnect('p1')
   assert.equal(children.length, 2)
   assert.equal(manager.isReady('p1'), true)
-  assert.ok(events.some((event) => event.state === 'restarting'))
-  assert.equal(events.at(-1)!.state, 'ready')
+  await manager.stopAll()
+})
+
+test('reconnect re-checks the Teleport login and keeps the tunnel lost on failure', async () => {
+  let sessionActive = true
+  const { manager, children } = harness({
+    checkStatus: async () => {
+      if (sessionActive) return { loggedIn: true, roles: [] }
+      return {
+        loggedIn: true,
+        roles: [],
+        validUntil: '2020-01-01T00:00:00Z',
+      }
+    },
+    now: () => Date.parse('2026-01-01T00:00:00Z'),
+  })
+  await manager.start('p1', config())
+  children[0].emitExit(1, null)
+  await wait(10)
+  assert.equal(manager.state('p1'), 'lost')
+
+  sessionActive = false
+  await assert.rejects(
+    manager.reconnect('p1'),
+    (error: unknown) =>
+      error instanceof PreConnectError &&
+      error.code === 'TSH_NOT_LOGGED_IN' &&
+      /expired/i.test(error.message),
+  )
+  assert.equal(children.length, 1)
+  assert.equal(manager.state('p1'), 'lost')
+
+  // Once the user has re-authenticated, a retry succeeds.
+  sessionActive = true
+  await manager.reconnect('p1')
+  assert.equal(children.length, 2)
+  assert.equal(manager.isReady('p1'), true)
   await manager.stopAll()
 })
 
@@ -230,23 +268,37 @@ test('stop tears the tunnel down and disables keepalive', async () => {
   assert.equal(children.length, 1)
 })
 
-test('a failed health check restarts the tunnel once the port stops responding', async () => {
-  let probes = 0
+test('a failed health check marks the tunnel lost and reconnect restores it', async () => {
+  let respond = true
   const { manager, children, events } = harness({
     healthIntervalMs: 5,
     healthFailureThreshold: 1,
-    probePort: async () => {
-      probes += 1
-      return probes > 1
-    },
+    probePort: async () => respond,
   })
   await manager.start('p1', config())
+  respond = false
   await wait(40)
 
+  assert.equal(children.length, 1)
+  assert.equal(manager.state('p1'), 'lost')
+  assert.ok(events.some((event) => event.state === 'lost'))
+
+  respond = true
+  await manager.reconnect('p1')
   assert.equal(children.length, 2)
   assert.equal(manager.isReady('p1'), true)
-  assert.ok(events.some((event) => event.state === 'restarting'))
   await manager.stopAll()
+})
+
+test('stop cleans up a lost tunnel', async () => {
+  const { manager, children } = harness()
+  await manager.start('p1', config())
+  children[0].emitExit(1, null)
+  await wait(10)
+  assert.equal(manager.state('p1'), 'lost')
+
+  await manager.stop('p1')
+  assert.equal(manager.state('p1'), undefined)
 })
 
 test('starting again supersedes and closes the previous tunnel', async () => {
