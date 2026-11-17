@@ -1,6 +1,4 @@
-import { useId } from 'react'
-import { Modal } from '@components/ui/Modal'
-import styles from './TunnelLostDialog.module.css'
+import { ConfirmationDialog } from '@components/ui/ConfirmationDialog'
 
 export interface TunnelLostRequest {
   requestId: string
@@ -16,37 +14,15 @@ export function TunnelLostDialog({
   request: TunnelLostRequest
   onAnswer: (requestId: string, reconnect: boolean) => void
 }) {
-  const titleId = useId()
-  const descriptionId = useId()
   return (
-    <Modal
+    <ConfirmationDialog
       open
-      onClose={() => onAnswer(request.requestId, false)}
-      labelledBy={titleId}
-      describedBy={descriptionId}
-      dialogClassName={styles.dialog}
-    >
-      <h2 id={titleId}>Teleport tunnel lost</h2>
-      <p id={descriptionId}>
-        The Teleport tunnel for &quot;{request.profileName}&quot; dropped.
-        Reconnect it now?
-      </p>
-      <div className={styles.actions}>
-        <button
-          type="button"
-          className="btn ghost"
-          onClick={() => onAnswer(request.requestId, false)}
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="btn"
-          onClick={() => onAnswer(request.requestId, true)}
-        >
-          Reconnect
-        </button>
-      </div>
-    </Modal>
+      title="Teleport tunnel lost"
+      description={`The Teleport tunnel for "${request.profileName}" dropped. Reconnect it now?`}
+      confirmLabel="Reconnect"
+      confirmClassName="btn"
+      onCancel={() => onAnswer(request.requestId, false)}
+      onConfirm={() => onAnswer(request.requestId, true)}
+    />
   )
 }
