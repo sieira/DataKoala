@@ -104,7 +104,8 @@ function harness(
       return child as unknown as TunnelProcess
     },
     waitForPort: async () => {},
-    probePort: async () => true,
+    probePort: async () => false,
+    findExistingTunnel: async () => false,
     healthIntervalMs: 1000,
     healthFailureThreshold: 2,
     killGraceMs: 5,
@@ -358,21 +359,24 @@ test('stop tears the tunnel down and disables keepalive', async () => {
 })
 
 test('a failed health check marks the tunnel lost and reconnect restores it', async () => {
-  let respond = true
+  // Probe order: (1) port free at launch, (2) first health check fails ->
+  // lost, (3) port free again at the reconnect launch, (4+) tunnel healthy.
+  let probes = 0
   const { manager, children, events } = harness({
     healthIntervalMs: 5,
     healthFailureThreshold: 1,
-    probePort: async () => respond,
+    probePort: async () => {
+      probes += 1
+      return probes > 3
+    },
   })
   await manager.start('p1', config())
-  respond = false
   await wait(40)
 
   assert.equal(children.length, 1)
   assert.equal(manager.state('p1'), 'lost')
   assert.ok(events.some((event) => event.state === 'lost'))
 
-  respond = true
   await manager.reconnect('p1')
   assert.equal(children.length, 2)
   assert.equal(manager.isReady('p1'), true)
@@ -388,6 +392,37 @@ test('stop cleans up a lost tunnel', async () => {
 
   await manager.stop('p1')
   assert.equal(manager.state('p1'), undefined)
+})
+
+test('a leftover tunnel for the same service is adopted instead of spawned', async () => {
+  const { manager, children, events } = harness({
+    findExistingTunnel: async () => true,
+  })
+  await manager.start('p1', config())
+
+  assert.equal(children.length, 0)
+  assert.equal(manager.isReady('p1'), true)
+  assert.ok(
+    events.some(
+      (event) => event.state === 'ready' && /Reusing/.test(event.message),
+    ),
+  )
+  await manager.stopAll()
+})
+
+test('a foreign listener on the tunnel port fails the start with an actionable error', async () => {
+  const { manager, children } = harness({
+    probePort: async () => true,
+    findExistingTunnel: async () => false,
+  })
+  await assert.rejects(
+    manager.start('p1', config()),
+    (error: unknown) =>
+      error instanceof PreConnectError &&
+      error.code === 'TUNNEL_FAILED' &&
+      /already in use/.test(error.message),
+  )
+  assert.equal(children.length, 0)
 })
 
 test('starting again supersedes and closes the previous tunnel', async () => {

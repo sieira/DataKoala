@@ -88,6 +88,12 @@ export interface TeleportDeps {
     signal: AbortSignal,
   ): Promise<void>
   probePort(port: number): Promise<boolean>
+  /**
+   * True when a `tsh proxy db --tunnel` process for this exact port and
+   * database service is already running — a leftover from a previous app run
+   * or the user's own terminal. Such a listener can be adopted.
+   */
+  findExistingTunnel(port: number, dbService: string): Promise<boolean>
   now(): number
   healthIntervalMs: number
   healthFailureThreshold: number
@@ -212,6 +218,47 @@ async function defaultCheckStatus(
 
 const LOGIN_TIMEOUT_MS = 180_000
 
+/**
+ * Detects a `tsh proxy db --tunnel` command line serving the exact port and
+ * database service. Such a tunnel is one of ours (this app, a previous run, or
+ * the user's own terminal) and can be reused; anything else on the port is a
+ * foreign listener. Windows has no `ps`; there the check resolves false and
+ * the occupied-port error carries the diagnosis.
+ */
+async function defaultFindExistingTunnel(
+  port: number,
+  dbService: string,
+): Promise<boolean> {
+  if (process.platform === 'win32') return false
+  return new Promise<boolean>((resolve) => {
+    execFile(
+      'ps',
+      ['-Ao', 'pid=,command='],
+      { timeout: 5_000 },
+      (error, stdout) => {
+        if (error) {
+          resolve(false)
+          return
+        }
+        const portMatch = new RegExp(
+          `(?:^|\\s)(?:-p|--port)(?:[ =])?${port}\\b`,
+        )
+        resolve(
+          String(stdout)
+            .split('\n')
+            .some(
+              (line) =>
+                line.includes('proxy db') &&
+                line.includes('--tunnel') &&
+                line.includes(dbService) &&
+                portMatch.test(line),
+            ),
+        )
+      },
+    )
+  })
+}
+
 async function defaultLogin(
   binary: string,
   args: string[],
@@ -247,6 +294,7 @@ export function createTeleportDeps(
     spawnTsh: defaultSpawnTsh,
     checkStatus: defaultCheckStatus,
     login: defaultLogin,
+    findExistingTunnel: defaultFindExistingTunnel,
     waitForPort: (port, timeoutMs, signal) =>
       waitForPort({
         host: DEFAULT_TUNNEL_HOST,
@@ -547,6 +595,32 @@ export class TeleportTunnelManager {
     intent: number,
   ): Promise<void> {
     this.setState(managed, profileId, 'starting', 'Starting Teleport tunnel…')
+    const port = managed.config.tunnelPort
+
+    // A previous app run can leave a detached `tsh proxy db` listening on this
+    // port (it survives even a hard app exit). When the leftover serves the
+    // same database service, adopt it instead of fighting over the port; an
+    // unknown listener is refused outright.
+    if (
+      await this.deps.findExistingTunnel(port, managed.config.dbService.trim())
+    ) {
+      this.setState(
+        managed,
+        profileId,
+        'ready',
+        `Reusing the tunnel already listening on ${DEFAULT_TUNNEL_HOST}:${port}.`,
+      )
+      if (isKeepaliveEnabled(managed.config))
+        this.startHealth(managed, profileId, intent)
+      return
+    }
+    if (await this.deps.probePort(port)) {
+      throw new PreConnectError(
+        'TUNNEL_FAILED',
+        `Port ${port} is already in use by another process. Close it (or pick a different tunnel port) and reconnect.`,
+      )
+    }
+
     const child = this.deps.spawnTsh(
       resolveTshBinary(managed.config),
       buildProxyDbArgs(managed.config),
@@ -563,14 +637,19 @@ export class TeleportTunnelManager {
     })
 
     let exitedResolve!: () => void
+    let childExited = false
     const exitDeferred = new Promise<void>((resolve) => {
       exitedResolve = resolve
     })
     child.on('error', (error) => {
       output.stderr = `${output.stderr}\n${error.message}`.trim()
+      childExited = true
       exitedResolve()
     })
-    child.on('exit', () => exitedResolve())
+    child.on('exit', () => {
+      childExited = true
+      exitedResolve()
+    })
 
     this.setState(
       managed,
@@ -578,7 +657,6 @@ export class TeleportTunnelManager {
       'waiting-for-port',
       `Waiting for the tunnel on ${DEFAULT_TUNNEL_HOST}:${managed.config.tunnelPort}…`,
     )
-    const port = managed.config.tunnelPort
     let portReady = false
     try {
       await Promise.race([
@@ -607,6 +685,20 @@ export class TeleportTunnelManager {
       // readiness timeout against a helper which ignores SIGTERM.
       await this.terminate(managed)
       throw error
+    }
+
+    // A listener on the port is not proof our child is alive: readiness may
+    // have been satisfied by a leftover tunnel from a previous app run. If the
+    // child already exited, the listener belongs to someone else.
+    if (childExited) {
+      const detail = summarizeTshFailure(output.stderr, output.stdout)
+      await this.terminate(managed)
+      throw new PreConnectError(
+        'TUNNEL_FAILED',
+        `The Teleport tunnel exited immediately, likely because port ${port} is already in use.${
+          detail ? ` ${detail}` : ''
+        }`,
+      )
     }
 
     if (!this.current(profileId, managed, intent)) {
