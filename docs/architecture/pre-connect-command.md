@@ -43,10 +43,21 @@ username, cluster, roles}`. This is the login check; it never opens a browser.
 | Mode        | Always `tsh proxy db --tunnel`                                      |
 | Readiness   | Poll `127.0.0.1:<tunnelPort>` until it accepts, or time out         |
 | Auth        | Check `tsh status` first; never run `tsh login` for the user        |
-| Keepalive   | Restart with backoff on exit; periodic TCP health-check             |
+| Keepalive   | Detect drops; reconnect only after user confirmation                |
 | Pool target | Derived `127.0.0.1:<tunnelPort>`; TLS disabled; no password         |
 | Secrets     | None stored; Teleport auth is out-of-band via `tsh login`           |
 | Binary      | `tsh` from PATH, with an optional absolute-path override            |
+
+## Domain terms
+
+- **Tunnel**: the local `tsh proxy db --tunnel` process opened for one saved
+  profile. DataKoala's word for the Teleport database access path.
+- **Keepalive**: the watch on a ready tunnel (process exit, TCP health check).
+  Keepalive detects drops; it never restarts anything.
+- **Lost**: the tunnel dropped and waits for the user. The `lost` state keeps
+  the tunnel config so a reconnect stays possible.
+- **Reconnect**: the user-confirmed restart of a lost tunnel, keeping the
+  tunnel's generation.
 
 ## Data model
 
@@ -91,6 +102,8 @@ the tunnel is enabled. `user` and `database` are shared, so they stay required.
   `INVALID_CONFIG`) and output sanitisation.
 - `src/main/preconnect/teleport-manager.ts` — `TeleportTunnelManager`: one
   supervised process per profile, generation-guarded.
+- `src/main/index.ts` installs the in-app reconnect prompt through
+  `db.setTunnelLostPrompt`; `db.ts` asks before Postgres-facing actions proceed.
 - `src/main/preconnect/effective-profile.ts` — `resolveTeleportConfig` and
   `applyTeleportTunnel` (pure translation).
 - `src/main/adapters/postgres-adapter.ts` — starts/stops the tunnel around
@@ -100,7 +113,7 @@ the tunnel is enabled. `user` and `database` are shared, so they stay required.
 
 ```
 checking-tsh → checking-login → starting → waiting-for-port → ready
-                                                    ↘ restarting → waiting-for-port …
+                                                    ↘ lost (user-confirmed reconnect → checking-login …)
 stopped / failed
 ```
 
@@ -108,10 +121,18 @@ stopped / failed
   `TSH_NOT_LOGGED_IN` ("Run tsh login, then try again").
 - **starting / waiting-for-port**: spawn detached (own process group) and poll
   the port. An early process exit fails the start with the sanitised stderr.
-- **ready**: if keepalive is on, a TCP health-check runs on an interval; two
-  consecutive failures, or an unexpected process exit, schedule a restart with
-  exponential backoff (also re-checking `tsh status`, so an expired certificate
-  surfaces as "run tsh login" rather than a cryptic pg error).
+- **ready**: if keepalive is on, a TCP health-check runs on an interval. Two
+  consecutive failures, or an unexpected process exit, mark the tunnel **lost**.
+- **lost**: the tunnel stays down until the user reconnects. The tunnel is
+  never respawned in the background because relaunching `tsh` can trigger a
+  Teleport re-auth flow (a browser tab) with no user action. The next query or
+  metadata action raises the in-app "Teleport tunnel lost — Reconnect?" dialog;
+  on confirmation the manager re-checks `tsh status` (an expired certificate
+  surfaces as "run tsh login") and relaunches the tunnel with the same
+  generation, so the original action then simply proceeds. On cancel, or after
+  a failed reconnect, the action fails with a typed "not connected" error and
+  the tunnel stays lost for a later retry — with no further prompting until
+  the user acts again.
 - **stop**: SIGTERM the process group, then SIGKILL after a grace period.
 
 Generation/intent guards (mirroring `postgres.ts`) ensure a superseded connect
@@ -167,7 +188,10 @@ field can still be typed by hand.
 - `src/shared/teleport.test.ts` — argv construction, status parsing, defaults.
 - `src/main/preconnect/port-probe.test.ts` — real `net.Server` readiness.
 - `src/main/preconnect/teleport-manager.test.ts` — a fake child covers ready,
-  failures, keepalive restart, health-check restart, supersede and teardown.
+  failures, keepalive loss detection, user-confirmed reconnect, supersede and
+  teardown.
+- `src/main/db.tunnel-lost.test.ts` — prompt wiring in the action entry points,
+  cancel and typed-failure handling.
 - `src/main/preconnect/effective-profile.test.ts` — profile translation.
 - `src/renderer/src/lib/connectionDraft.test.ts` and
   `ConnectionModal.test.tsx` — draft round-trip and the Advanced tab.
@@ -181,5 +205,6 @@ field can still be typed by hand.
   explicitly if `tsh` is not found.
 - Only Teleport `--tunnel` mode is supported (the certificate mode needs client
   certificates that DataKoala does not manage).
-- A tunnel restart relies on the existing pool idle-recovery path; the pool is
-  not force-reconnected. The database user must match the Teleport `--db-user`.
+- A tunnel reconnect relies on the existing pool idle-recovery path to replace
+  clients broken by the drop; the pool is not force-reconnected. The database
+  user must match the Teleport `--db-user`.

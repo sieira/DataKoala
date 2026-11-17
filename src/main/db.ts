@@ -253,6 +253,69 @@ function session(id: ConnectionId): DataSourceSession {
   return value
 }
 
+/**
+ * Teleport tunnels are never respawned in the background (a relaunch can open
+ * a browser for re-auth without any user action). When a connection's tunnel
+ * was lost, explicit user actions (run, explain) ask once through the prompt
+ * installed by the shell layer and reconnect only on confirmation; background
+ * loads never prompt and fail with a typed error instead. Concurrent actions
+ * on the same connection share one prompt.
+ */
+let tunnelLostPrompt: ((id: ConnectionId) => Promise<boolean>) | null = null
+let pendingPrompt: Promise<{
+  confirmed: boolean
+  failure: string | null
+}> | null = null
+let pendingPromptId: ConnectionId | null = null
+
+export function setTunnelLostPrompt(
+  prompt: ((id: ConnectionId) => Promise<boolean>) | null,
+): void {
+  tunnelLostPrompt = prompt
+}
+
+async function requireTunnel(
+  id: ConnectionId,
+  allowPrompt: boolean,
+): Promise<void> {
+  if (!postgresAdapter.tunnelLost(id)) return
+  const blocked = () =>
+    new DatabaseConnectionError(
+      'NOT_CONNECTED',
+      'The Teleport tunnel is disconnected. Reconnect it to continue.',
+    )
+  if (!allowPrompt || !tunnelLostPrompt) throw blocked()
+  if (pendingPromptId !== id && pendingPrompt) throw blocked()
+  let pending = pendingPrompt
+  if (!pending) {
+    pendingPromptId = id
+    pending = (async () => {
+      const confirmed = await tunnelLostPrompt(id)
+      if (!confirmed)
+        return { confirmed: false, failure: null as string | null }
+      try {
+        await postgresAdapter.reconnectTunnel(id)
+      } catch (error) {
+        return {
+          confirmed: true,
+          failure:
+            error instanceof Error ? error.message : String(error ?? 'Error'),
+        }
+      }
+      return { confirmed: true, failure: null }
+    })().finally(() => {
+      pendingPrompt = null
+      pendingPromptId = null
+    })
+    pendingPrompt = pending
+  }
+  const answer = await pending
+  if (!answer.confirmed) throw blocked()
+  if (answer.failure)
+    throw new DatabaseConnectionError('NOT_CONNECTED', answer.failure)
+  if (postgresAdapter.tunnelLost(id)) throw blocked()
+}
+
 const seriesProbes = new SeriesCardinalityProbes((measurement) => {
   if (process.env.DATAKOALA_DEBUG_CARDINALITY === '1')
     console.debug('[series-cardinality]', JSON.stringify(measurement))
@@ -262,6 +325,7 @@ export async function probeSeriesCardinality(
   id: ConnectionId,
   request: unknown,
 ) {
+  await requireTunnel(id, false)
   const active = session(id)
   const result = await seriesProbes.probe(active, request)
   if (session(id) !== active)
@@ -269,10 +333,11 @@ export async function probeSeriesCardinality(
   return result
 }
 
-export function querySeriesStatistics(
+export async function querySeriesStatistics(
   id: ConnectionId,
   request: SeriesStatisticsRequest,
 ) {
+  await requireTunnel(id, false)
   return seriesStatistics(session(id), request)
 }
 
@@ -290,6 +355,7 @@ export async function runQuery(
   prometheus?: Omit<PrometheusQueryRequest, 'expression'>,
   tempo?: TempoQueryRequest,
 ): Promise<QueryResult> {
+  await requireTunnel(id, true)
   const activeSession = session(id)
   // QUERY_RUN predates Tempo and currently exposes the Prometheus range slot through
   // preload. Preserve the shared start/end bounds plus Tempo-only search controls and
@@ -394,6 +460,7 @@ export function formatLokiQuery(
 }
 
 export async function listObjects(id: ConnectionId) {
+  await requireTunnel(id, false)
   return (await session(id).listRelations()).map((relation) => ({
     schema: relation.namespace,
     name: relation.name,
@@ -413,6 +480,7 @@ export async function listObjects(id: ConnectionId) {
 
 /** Refresh discovery owned by a live provider session. This deliberately does not reconnect. */
 export async function refreshMetadata(id: ConnectionId): Promise<void> {
+  await requireTunnel(id, false)
   await session(id).refreshMetadata?.()
 }
 
@@ -421,6 +489,7 @@ export async function describeTable(
   schema: string,
   table: string,
 ) {
+  await requireTunnel(id, false)
   return (
     await session(id).describeRelation({ namespace: schema, name: table })
   ).map((column) => ({
@@ -482,6 +551,7 @@ export async function explainQuery(
   sql: string,
   analyze: boolean,
 ) {
+  await requireTunnel(id, true)
   const explain = session(id).explain
   if (!explain) throw new Error('Explain is not supported by this datasource.')
   return explain(sql, analyze)

@@ -37,7 +37,10 @@ function reasonOf(error: unknown): string {
 /** Shared across profiles; the manager keys tunnels by profile id internally. */
 const sharedTunnels = new TeleportTunnelManager()
 
-type TunnelManager = Pick<TeleportTunnelManager, 'start' | 'stop' | 'stopAll'>
+type TunnelManager = Pick<
+  TeleportTunnelManager,
+  'start' | 'stop' | 'stopAll' | 'reconnect' | 'state'
+>
 
 /**
  * Test runs against a throwaway tunnel key so it never disturbs a live
@@ -182,6 +185,15 @@ export class PostgresAdapter implements DataSourceAdapter {
     onPostgresStateChanged(listener)
   }
 
+  /** True when keepalive detected the drop and the tunnel awaits a user-confirmed reconnect. */
+  tunnelLost(profileId: string): boolean {
+    return this.tunnels.state(profileId) === 'lost'
+  }
+
+  async reconnectTunnel(profileId: string): Promise<void> {
+    await this.tunnels.reconnect(profileId)
+  }
+
   async cancelConnect(profileId: string): Promise<void> {
     try {
       await disconnect(profileId)
@@ -200,3 +212,6 @@ export class PostgresAdapter implements DataSourceAdapter {
 }
 
 export { DatabaseConnectionError, __testing } from './postgres.ts'
+
+/** Test seam for db-level tests: the shared tunnel manager behind the adapter. */
+export const __tunnelTesting = { sharedTunnels }

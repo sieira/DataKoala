@@ -28,7 +28,7 @@ export type PreConnectState =
   | 'starting'
   | 'waiting-for-port'
   | 'ready'
-  | 'restarting'
+  | 'lost'
   | 'failed'
   | 'stopped'
 
@@ -37,7 +37,6 @@ export interface PreConnectStateEvent {
   state: PreConnectState
   message: string
   code: PreConnectErrorCode | null
-  attempt: number
   generation: number
   timestamp: number
 }
@@ -78,11 +77,8 @@ export interface TeleportDeps {
   ): Promise<void>
   probePort(port: number): Promise<boolean>
   now(): number
-  restartBaseDelayMs: number
-  restartMaxDelayMs: number
   healthIntervalMs: number
   healthFailureThreshold: number
-  maxRestarts: number
   killGraceMs: number
 }
 
@@ -90,13 +86,11 @@ interface ManagedTunnel {
   config: TeleportPreConnect
   generation: number
   state: PreConnectState
-  attempt: number
   stopping: boolean
   child: TunnelProcess | null
   termination?: Promise<void>
   abort: AbortController
   healthTimer: ReturnType<typeof setInterval> | null
-  restartTimer: ReturnType<typeof setTimeout> | null
   consecutiveHealthFailures: number
 }
 
@@ -220,11 +214,8 @@ export function createTeleportDeps(
     probePort: (port) =>
       probePort(DEFAULT_TUNNEL_HOST, port, DEFAULT_PROBE_CONNECT_TIMEOUT_MS),
     now: () => Date.now(),
-    restartBaseDelayMs: 500,
-    restartMaxDelayMs: 10_000,
     healthIntervalMs: 10_000,
     healthFailureThreshold: 2,
-    maxRestarts: 10,
     killGraceMs: 2000,
     ...overrides,
   }
@@ -234,6 +225,11 @@ export function createTeleportDeps(
  * Owns one `tsh proxy db` process per profile. Starting is generation-guarded so
  * a superseded connect can neither kill nor leak a fresh tunnel, and readiness is
  * confirmed by polling the local port before the caller opens a Postgres pool.
+ *
+ * A dropped tunnel is never respawned in the background: relaunching `tsh` can
+ * trigger a Teleport re-auth flow (a browser tab) without any user action. The
+ * tunnel enters the `lost` state instead and only `reconnect` — called after the
+ * user confirms — starts it again.
  */
 export class TeleportTunnelManager {
   private readonly deps: TeleportDeps
@@ -276,18 +272,7 @@ export class TeleportTunnelManager {
     this.intents.set(profileId, intent)
 
     this.validate(config)
-    const managed: ManagedTunnel = {
-      config,
-      generation: ++this.nextGeneration,
-      state: 'checking-tsh',
-      attempt: 0,
-      stopping: false,
-      child: null,
-      abort: new AbortController(),
-      healthTimer: null,
-      restartTimer: null,
-      consecutiveHealthFailures: 0,
-    }
+    const managed = this.newManagedTunnel(config)
     this.tunnels.set(profileId, managed)
     this.setState(
       managed,
@@ -307,6 +292,66 @@ export class TeleportTunnelManager {
     return managed.generation
   }
 
+  /**
+   * Restores a tunnel that entered the `lost` state, keeping its generation so
+   * a caller holding the original one can still stop the restored tunnel. A
+   * failed reconnect keeps the tunnel lost (with the failure surfaced in the
+   * state event) so the user can retry.
+   */
+  async reconnect(profileId: ConnectionId): Promise<void> {
+    const managed = this.tunnels.get(profileId)
+    if (!managed || managed.state !== 'lost') return
+    const intent = ++this.nextIntent
+    this.intents.set(profileId, intent)
+    try {
+      // A dropped tunnel is often an expired certificate; re-checking login turns
+      // a cryptic failure into an actionable message.
+      await this.verifyLogin(managed, profileId, intent)
+      await this.launch(managed, profileId, intent)
+    } catch (error) {
+      if (error instanceof SupersededError) throw error
+      await this.terminate(managed)
+      if (managed.stopping || this.tunnels.get(profileId) !== managed)
+        throw error
+      this.setState(
+        managed,
+        profileId,
+        'lost',
+        messageOf(error),
+        error instanceof PreConnectError ? error.code : null,
+      )
+      throw error
+    }
+  }
+
+  private newManagedTunnel(config: TeleportPreConnect): ManagedTunnel {
+    return {
+      config,
+      generation: ++this.nextGeneration,
+      state: 'checking-tsh',
+      stopping: false,
+      child: null,
+      abort: new AbortController(),
+      healthTimer: null,
+      consecutiveHealthFailures: 0,
+    }
+  }
+
+  /**
+   * Test seam: records a `lost` tunnel for `profileId` without running `tsh`,
+   * so higher-level tests can exercise loss handling end to end.
+   */
+  markLostForTest(profileId: ConnectionId, config: TeleportPreConnect): void {
+    const managed = this.newManagedTunnel(config)
+    this.tunnels.set(profileId, managed)
+    this.setState(
+      managed,
+      profileId,
+      'lost',
+      'The Teleport tunnel stopped. (test seam)',
+    )
+  }
+
   async stop(profileId: ConnectionId, generation?: number): Promise<void> {
     const current = this.tunnels.get(profileId)
     if (generation !== undefined && current?.generation !== generation) {
@@ -318,10 +363,6 @@ export class TeleportTunnelManager {
     current.stopping = true
     current.abort.abort()
     this.stopHealth(current)
-    if (current.restartTimer) {
-      clearTimeout(current.restartTimer)
-      current.restartTimer = null
-    }
     await this.terminate(current)
     if (this.tunnels.get(profileId) === current) this.tunnels.delete(profileId)
     this.setState(current, profileId, 'stopped', 'Teleport tunnel closed.')
@@ -413,6 +454,8 @@ export class TeleportTunnelManager {
     intent: number,
   ): Promise<void> {
     this.setState(managed, profileId, 'starting', 'Starting Teleport tunnel…')
+    const port = managed.config.tunnelPort
+
     const child = this.deps.spawnTsh(
       resolveTshBinary(managed.config),
       buildProxyDbArgs(managed.config),
@@ -429,14 +472,19 @@ export class TeleportTunnelManager {
     })
 
     let exitedResolve!: () => void
+    let childExited = false
     const exitDeferred = new Promise<void>((resolve) => {
       exitedResolve = resolve
     })
     child.on('error', (error) => {
       output.stderr = `${output.stderr}\n${error.message}`.trim()
+      childExited = true
       exitedResolve()
     })
-    child.on('exit', () => exitedResolve())
+    child.on('exit', () => {
+      childExited = true
+      exitedResolve()
+    })
 
     this.setState(
       managed,
@@ -444,7 +492,6 @@ export class TeleportTunnelManager {
       'waiting-for-port',
       `Waiting for the tunnel on ${DEFAULT_TUNNEL_HOST}:${managed.config.tunnelPort}…`,
     )
-    const port = managed.config.tunnelPort
     let portReady = false
     try {
       await Promise.race([
@@ -475,12 +522,25 @@ export class TeleportTunnelManager {
       throw error
     }
 
+    // A listener on the port is not proof our child is alive: readiness may
+    // have been satisfied by a leftover tunnel from a previous app run. If the
+    // child already exited, the listener belongs to someone else.
+    if (childExited) {
+      const detail = summarizeTshFailure(output.stderr, output.stdout)
+      await this.terminate(managed)
+      throw new PreConnectError(
+        'TUNNEL_FAILED',
+        `The Teleport tunnel exited immediately, likely because port ${port} is already in use.${
+          detail ? ` ${detail}` : ''
+        }`,
+      )
+    }
+
     if (!this.current(profileId, managed, intent)) {
       await this.terminate(managed)
       throw new SupersededError()
     }
 
-    managed.attempt = 0
     managed.consecutiveHealthFailures = 0
     this.setState(
       managed,
@@ -503,7 +563,7 @@ export class TeleportTunnelManager {
     output: { stderr: string; stdout: string },
   ): void {
     if (!this.current(profileId, managed, intent)) return
-    if (managed.state === 'restarting') return
+    if (managed.state === 'lost') return
     this.stopHealth(managed)
     managed.child = null
     const detail = summarizeTshFailure(output.stderr, output.stdout)
@@ -520,66 +580,17 @@ export class TeleportTunnelManager {
       )
       return
     }
-    this.scheduleRestart(
-      managed,
-      profileId,
-      intent,
-      detail || 'the tunnel process stopped',
-    )
-  }
-
-  private scheduleRestart(
-    managed: ManagedTunnel,
-    profileId: ConnectionId,
-    intent: number,
-    reason: string,
-  ): void {
-    if (!this.current(profileId, managed, intent)) return
-    if (managed.attempt >= this.deps.maxRestarts) {
-      void this.fail(
-        managed,
-        profileId,
-        new PreConnectError(
-          'TUNNEL_FAILED',
-          `The Teleport tunnel could not be restored after ${this.deps.maxRestarts} attempts (${reason}).`,
-        ),
-      )
-      return
-    }
-    managed.attempt += 1
-    const delay = Math.min(
-      this.deps.restartBaseDelayMs * 2 ** (managed.attempt - 1),
-      this.deps.restartMaxDelayMs,
-    )
+    // Keepalive only detects the drop; respawning `tsh` could open a browser
+    // for re-auth without the user asking for it. Wait for an explicit
+    // reconnect instead.
     this.setState(
       managed,
       profileId,
-      'restarting',
-      `Teleport tunnel dropped (${reason}). Reconnecting…`,
+      'lost',
+      detail
+        ? `The Teleport tunnel stopped. ${detail}`
+        : 'The Teleport tunnel stopped.',
     )
-    managed.restartTimer = setTimeout(() => {
-      managed.restartTimer = null
-      void this.recover(managed, profileId, intent)
-    }, delay)
-    managed.restartTimer.unref?.()
-  }
-
-  private async recover(
-    managed: ManagedTunnel,
-    profileId: ConnectionId,
-    intent: number,
-  ): Promise<void> {
-    if (!this.current(profileId, managed, intent)) return
-    try {
-      // A dropped tunnel is often an expired certificate; re-checking login turns
-      // a cryptic pg failure into an actionable "run tsh login" message.
-      await this.verifyLogin(managed, profileId, intent)
-      await this.launch(managed, profileId, intent)
-    } catch (error) {
-      if (error instanceof SupersededError) return
-      if (!this.current(profileId, managed, intent)) return
-      this.scheduleRestart(managed, profileId, intent, messageOf(error))
-    }
   }
 
   private startHealth(
@@ -618,20 +629,14 @@ export class TeleportTunnelManager {
     if (managed.consecutiveHealthFailures < this.deps.healthFailureThreshold)
       return
     this.stopHealth(managed)
-    // Mark restarting before killing so the child's own exit handler is inert.
+    // Mark lost before killing so the child's own exit handler is inert.
     this.setState(
       managed,
       profileId,
-      'restarting',
-      'The Teleport tunnel stopped responding. Reconnecting…',
+      'lost',
+      'The Teleport tunnel stopped responding.',
     )
     await this.terminate(managed)
-    this.scheduleRestart(
-      managed,
-      profileId,
-      intent,
-      'the tunnel stopped responding',
-    )
   }
 
   private async fail(
@@ -640,10 +645,6 @@ export class TeleportTunnelManager {
     error: unknown,
   ): Promise<void> {
     this.stopHealth(managed)
-    if (managed.restartTimer) {
-      clearTimeout(managed.restartTimer)
-      managed.restartTimer = null
-    }
     await this.terminate(managed)
     if (managed.stopping || this.tunnels.get(profileId) !== managed) return
     this.tunnels.delete(profileId)
@@ -707,7 +708,6 @@ export class TeleportTunnelManager {
       state,
       message,
       code,
-      attempt: managed.attempt,
       generation: managed.generation,
       timestamp: this.deps.now(),
     }

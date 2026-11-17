@@ -171,6 +171,22 @@ const api = {
       }): Promise<TeleportDiscoverResult> =>
         ipcRenderer.invoke(IPC.CONNECTION_TELEPORT_DISCOVER, options),
     },
+    onTunnelLost: (
+      listener: (request: { requestId: string; profileName: string }) => void,
+    ): (() => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, value: unknown) => {
+        if (isTunnelLostRequest(value)) listener(value)
+      }
+      ipcRenderer.on(IPC.CONNECTION_TUNNEL_LOST, handler)
+      return () =>
+        ipcRenderer.removeListener(IPC.CONNECTION_TUNNEL_LOST, handler)
+    },
+    answerTunnelLost: (requestId: string, reconnect: boolean): Promise<void> =>
+      ipcRenderer.invoke(
+        IPC.CONNECTION_TUNNEL_LOST_ANSWER,
+        requestId,
+        reconnect,
+      ),
     prometheus: {
       discover: (
         transport: PrometheusTransportConfig,
@@ -320,6 +336,17 @@ const api = {
     write: (scene: string): Promise<{ ok: true } | { ok: false }> =>
       ipcRenderer.invoke(IPC.CLIPBOARD_WRITE_EXCALIDRAW, scene),
   },
+}
+
+function isTunnelLostRequest(
+  value: unknown,
+): value is { requestId: string; profileName: string } {
+  if (!value || typeof value !== 'object') return false
+  const request = value as Record<string, unknown>
+  return (
+    typeof request.requestId === 'string' &&
+    typeof request.profileName === 'string'
+  )
 }
 
 function isConnectionStateEvent(value: unknown): value is ConnectionStateEvent {

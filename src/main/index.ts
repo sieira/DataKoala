@@ -48,6 +48,9 @@ import { queryFailureKind, queryFailureMessage } from './query-failure'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
+/** How long the renderer may hold an unanswered tunnel-lost prompt. */
+const TUNNEL_PROMPT_TIMEOUT_MS = 120_000
+
 process.env.APP_ROOT = resolve(__dirname, '../..')
 
 let mainWindow: BrowserWindow | null = null
@@ -692,6 +695,42 @@ app.on('before-quit', (event) => {
 })
 
 function registerIpc(): void {
+  // Keepalive only detects a dropped Teleport tunnel; reconnecting is a user
+  // decision. The renderer shows the house-made prompt and answers through
+  // CONNECTION_TUNNEL_LOST_ANSWER; the guard performs the reconnect. An
+  // unanswered prompt (window closed, renderer reloaded) times out to cancel
+  // so the blocked action fails cleanly instead of hanging forever.
+  let tunnelPromptSequence = 0
+  const tunnelPromptWaiters = new Map<string, (reconnect: boolean) => void>()
+  ipcMain.handle(
+    IPC.CONNECTION_TUNNEL_LOST_ANSWER,
+    (_event, requestId: unknown, reconnect: unknown) => {
+      if (typeof requestId !== 'string') return
+      const resolve = tunnelPromptWaiters.get(requestId)
+      if (!resolve) return
+      tunnelPromptWaiters.delete(requestId)
+      resolve(reconnect === true)
+    },
+  )
+  db.setTunnelLostPrompt(async (id) => {
+    const win = mainWindow
+    if (!win || win.isDestroyed() || isQuitting) return false
+    const profile = await connectionProfiles.get(id).catch(() => undefined)
+    const profileName = profile?.name ?? id
+    const requestId = `tunnel-lost-${Date.now()}-${++tunnelPromptSequence}`
+    const answer = new Promise<boolean>((resolve) => {
+      tunnelPromptWaiters.set(requestId, resolve)
+      const timer = setTimeout(() => {
+        if (tunnelPromptWaiters.delete(requestId)) resolve(false)
+      }, TUNNEL_PROMPT_TIMEOUT_MS)
+      timer.unref?.()
+    })
+    win.webContents.send(IPC.CONNECTION_TUNNEL_LOST, {
+      requestId,
+      profileName,
+    })
+    return answer
+  })
   ipcMain.handle(IPC.EXTERNAL_OPEN_URL, (_event, url: unknown) =>
     shell.openExternal(validateExternalUrl(url)),
   )

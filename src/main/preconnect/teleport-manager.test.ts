@@ -95,12 +95,9 @@ function harness(overrides: Partial<TeleportDeps> = {}): Harness {
       return child as unknown as TunnelProcess
     },
     waitForPort: async () => {},
-    probePort: async () => true,
-    restartBaseDelayMs: 1,
-    restartMaxDelayMs: 1,
+    probePort: async () => false,
     healthIntervalMs: 1000,
     healthFailureThreshold: 2,
-    maxRestarts: 5,
     killGraceMs: 5,
     ...overrides,
   })
@@ -202,7 +199,7 @@ test('a tunnel that exits before the port opens fails the start', async () => {
   assert.equal(manager.isReady('p1'), false)
 })
 
-test('keepalive restarts the tunnel after an unexpected exit', async () => {
+test('keepalive marks the tunnel lost after an unexpected exit and reconnect restores it', async () => {
   const { manager, children, events } = harness()
   await manager.start('p1', config())
   assert.equal(children.length, 1)
@@ -210,10 +207,14 @@ test('keepalive restarts the tunnel after an unexpected exit', async () => {
   children[0].emitExit(1, null)
   await wait(30)
 
+  // No background respawn: the tunnel waits for an explicit reconnect.
+  assert.equal(children.length, 1)
+  assert.equal(manager.state('p1'), 'lost')
+  assert.ok(events.some((event) => event.state === 'lost'))
+
+  await manager.reconnect('p1')
   assert.equal(children.length, 2)
   assert.equal(manager.isReady('p1'), true)
-  assert.ok(events.some((event) => event.state === 'restarting'))
-  assert.equal(events.at(-1)!.state, 'ready')
   await manager.stopAll()
 })
 
@@ -230,7 +231,8 @@ test('stop tears the tunnel down and disables keepalive', async () => {
   assert.equal(children.length, 1)
 })
 
-test('a failed health check restarts the tunnel once the port stops responding', async () => {
+test('a failed health check marks the tunnel lost and reconnect restores it', async () => {
+  // The first health check fails the tunnel; the reconnect launches healthy.
   let probes = 0
   const { manager, children, events } = harness({
     healthIntervalMs: 5,
@@ -243,10 +245,25 @@ test('a failed health check restarts the tunnel once the port stops responding',
   await manager.start('p1', config())
   await wait(40)
 
+  assert.equal(children.length, 1)
+  assert.equal(manager.state('p1'), 'lost')
+  assert.ok(events.some((event) => event.state === 'lost'))
+
+  await manager.reconnect('p1')
   assert.equal(children.length, 2)
   assert.equal(manager.isReady('p1'), true)
-  assert.ok(events.some((event) => event.state === 'restarting'))
   await manager.stopAll()
+})
+
+test('stop cleans up a lost tunnel', async () => {
+  const { manager, children } = harness()
+  await manager.start('p1', config())
+  children[0].emitExit(1, null)
+  await wait(10)
+  assert.equal(manager.state('p1'), 'lost')
+
+  await manager.stop('p1')
+  assert.equal(manager.state('p1'), undefined)
 })
 
 test('starting again supersedes and closes the previous tunnel', async () => {

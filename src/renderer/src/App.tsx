@@ -9,6 +9,8 @@ import { TraceExplorer } from '@components/workspaces/tempo/TraceExplorer'
 import { LokiExplorer } from '@components/workspaces/loki/LokiExplorer'
 import { QueryTabs } from '@components/query/QueryTabs'
 import { ConnectionStatus } from '@components/connections/ConnectionStatus'
+import { TunnelLostDialog } from '@components/connections/TunnelLostDialog'
+import type { TunnelLostRequest } from '@components/connections/TunnelLostDialog'
 import {
   EDITOR_MIN,
   SIDEBAR_MIN,
@@ -65,6 +67,16 @@ export function App() {
       parseStoredDimension(storedDimension(EDITOR_STORAGE_KEY), 300),
       editorBounds(window.innerHeight - TITLEBAR_HEIGHT),
     ),
+  )
+  const [tunnelLostRequest, setTunnelLostRequest] =
+    useState<TunnelLostRequest | null>(null)
+
+  useEffect(
+    () =>
+      api.connections.onTunnelLost((request) => {
+        setTunnelLostRequest(request)
+      }),
+    [],
   )
 
   useEffect(
@@ -332,6 +344,15 @@ export function App() {
 
       <ExplainPane />
       <NotificationArea />
+      {tunnelLostRequest && (
+        <TunnelLostDialog
+          request={tunnelLostRequest}
+          onAnswer={(requestId, reconnect) => {
+            setTunnelLostRequest(null)
+            void api.connections.answerTunnelLost(requestId, reconnect)
+          }}
+        />
+      )}
     </div>
   )
 }

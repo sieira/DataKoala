@@ -8,6 +8,8 @@ export function ConfirmationDialog({
   title,
   description,
   confirmLabel,
+  /** Confirm buttons are destructive by default; pass "btn" for plain primary. */
+  confirmClassName = 'btn danger',
   onCancel,
   onConfirm,
   returnFocusRef,
@@ -18,6 +20,7 @@ export function ConfirmationDialog({
   title: string
   description: ReactNode
   confirmLabel: string
+  confirmClassName?: string
   onCancel: () => void
   onConfirm: () => void | Promise<void>
   returnFocusRef?: React.RefObject<HTMLElement | null>
@@ -74,7 +77,7 @@ export function ConfirmationDialog({
         </button>
         <button
           type="button"
-          className="btn danger"
+          className={confirmClassName}
           onClick={() => void confirm()}
           disabled={disabled || pending}
           aria-busy={pending}

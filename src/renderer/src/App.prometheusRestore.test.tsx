@@ -35,6 +35,8 @@ vi.mock('./lib/api', () => ({
       list: mocks.list,
       listLive: mocks.listLive,
       onStateChanged: vi.fn(() => () => undefined),
+      onTunnelLost: vi.fn(() => () => undefined),
+      answerTunnelLost: vi.fn(),
       connect: vi.fn(),
       disconnect: vi.fn(),
       remove: vi.fn(),
