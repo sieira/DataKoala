@@ -38,7 +38,7 @@ test('runQuery prompts on a lost tunnel and fails with a typed error on cancel',
   }
 })
 
-test('refreshMetadata goes through the same guard, and connected actions never prompt', async () => {
+test('background loads fail fast without prompting on a lost tunnel', async () => {
   const manager = __tunnelTesting.sharedTunnels
   let prompts = 0
   setTunnelLostPrompt(async () => {
@@ -53,7 +53,7 @@ test('refreshMetadata goes through the same guard, and connected actions never p
         error instanceof DatabaseConnectionError &&
         error.code === 'NOT_CONNECTED',
     )
-    assert.equal(prompts, 1)
+    assert.equal(prompts, 0)
 
     // An unknown, never-connected profile has no lost tunnel: the guard passes
     // through without prompting and the action fails as not connected.
@@ -61,7 +61,7 @@ test('refreshMetadata goes through the same guard, and connected actions never p
       refreshMetadata('wiring-unknown'),
       (error: unknown) => error instanceof DatabaseConnectionError,
     )
-    assert.equal(prompts, 1)
+    assert.equal(prompts, 0)
   } finally {
     await manager.stopAll()
     setTunnelLostPrompt(null)
