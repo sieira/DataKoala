@@ -3,7 +3,6 @@ import test from 'node:test'
 import type { TeleportPreConnect } from './types.ts'
 import {
   DEFAULT_TUNNEL_TIMEOUT_MS,
-  buildLoginArgs,
   buildProxyDbArgs,
   formatProxyDbCommand,
   isSessionExpired,
@@ -110,22 +109,6 @@ test('formatProxyDbCommand previews the spawn without executing it', () => {
     formatProxyDbCommand(config()),
     'tsh proxy db --tunnel -p 5433 example-postgres',
   )
-})
-
-test('buildLoginArgs uses the stored proxy and login, or tsh defaults', () => {
-  assert.deepEqual(buildLoginArgs(config()), ['login'])
-  assert.deepEqual(
-    buildLoginArgs(
-      config({
-        proxy: 'example.teleport.sh:443',
-        login: 'user@example.iam',
-      }),
-    ),
-    ['login', '--proxy=example.teleport.sh:443', '--user=user@example.iam'],
-  )
-  assert.deepEqual(buildLoginArgs(config({ proxy: '   ', login: '' })), [
-    'login',
-  ])
 })
 
 test('parseTshStatus reads the active session', () => {

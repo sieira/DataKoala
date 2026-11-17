@@ -8,7 +8,6 @@ export type ConnectionLifecycleState =
   | 'disconnecting'
   | 'disconnected'
   | 'failed'
-  | 'lost'
 export type ConnectionErrorCode =
   | 'CONNECTION_LOST'
   | 'NOT_CONNECTED'

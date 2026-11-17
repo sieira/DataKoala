@@ -42,7 +42,6 @@ import { performance } from 'node:perf_hooks'
 import { formatPromql } from './promql-formatter.ts'
 import { toIpcSafeQueryResult } from './ipc-serialization.ts'
 import { publishTempoSearchProgress } from './query-progress.ts'
-import { TunnelLostGuard, type TunnelLostPrompt } from './tunnel-lost-guard.ts'
 
 const postgresAdapter = new PostgresAdapter()
 export const adapterRegistry = new AdapterRegistry()
@@ -152,11 +151,6 @@ export class SessionManager {
     return this.sessions.get(id)?.session
   }
 
-  /** The live session's generation, or undefined when nothing is connected. */
-  generationOf(id: ConnectionId): number | undefined {
-    return this.sessions.get(id)?.result.generation
-  }
-
   listLive(): Array<{
     id: ConnectionId
     generation: number
@@ -204,43 +198,6 @@ export function onConnectionStateChanged(
     if (event.state === 'failed' || event.state === 'disconnected')
       sessionManager.forget(event.profileId, event.generation)
     listener(event)
-  })
-  // Tunnel keepalive reaches the UI as connection state: a lost tunnel marks
-  // the connection errored (the session survives so a confirmed reconnect
-  // just works), and a restored tunnel clears the error. Test tunnels and
-  // profiles without a live session are ignored — the chip already shows
-  // disconnected for those.
-  const tunnelLostProfiles = new Set<ConnectionId>()
-  postgresAdapter.onTunnelStateChanged((tunnel) => {
-    const generation = sessionManager.generationOf(tunnel.profileId)
-    if (generation === undefined) return
-    if (tunnel.state === 'lost') {
-      tunnelLostProfiles.add(tunnel.profileId)
-      listener({
-        profileId: tunnel.profileId,
-        state: 'lost',
-        expected: false,
-        message: tunnel.message,
-        code: 'CONNECTION_LOST',
-        generation,
-        timestamp: Date.now(),
-        recoverable: true,
-        source: 'teleport-tunnel',
-      })
-      return
-    }
-    if (tunnelLostProfiles.delete(tunnel.profileId))
-      listener({
-        profileId: tunnel.profileId,
-        state: 'connected',
-        expected: true,
-        message: '',
-        code: null,
-        generation,
-        timestamp: Date.now(),
-        recoverable: true,
-        source: 'teleport-tunnel',
-      })
   })
 }
 
@@ -298,17 +255,86 @@ function session(id: ConnectionId): DataSourceSession {
 
 /**
  * Teleport tunnels are never respawned in the background (a relaunch can open
- * a browser for re-auth without any user action): the shell layer installs a
- * confirmation prompt, and Postgres-facing actions run it before proceeding.
+ * a browser for re-auth without any user action). Before an action touches a
+ * connection whose tunnel was lost, ask the user once through the prompt
+ * installed by the shell layer; reconnect only on confirmation. Concurrent
+ * actions on the same connection share one prompt; a different connection
+ * fails fast instead of stacking dialogs.
  */
-const tunnelLostGuard = new TunnelLostGuard({
-  isLost: (id) => postgresAdapter.tunnelLost(id),
-  reconnect: (id) => postgresAdapter.reconnectTunnel(id),
-  failure: (message) => new DatabaseConnectionError('NOT_CONNECTED', message),
-})
+let tunnelLostPrompt: ((id: ConnectionId) => Promise<boolean>) | null = null
+let pendingPrompt: Promise<{
+  confirmed: boolean
+  failure: string | null
+}> | null = null
+let pendingPromptId: ConnectionId | null = null
+/**
+ * Connections whose lost-tunnel prompt the user answered with cancel: fail
+ * fast without re-prompting until the tunnel is usable again, so one dropped
+ * tunnel costs exactly one dialog.
+ */
+const dismissedTunnelPrompts = new Set<ConnectionId>()
 
-export function setTunnelLostPrompt(prompt: TunnelLostPrompt | null): void {
-  tunnelLostGuard.setPrompt(prompt)
+export function setTunnelLostPrompt(
+  prompt: ((id: ConnectionId) => Promise<boolean>) | null,
+): void {
+  tunnelLostPrompt = prompt
+}
+
+async function requireTunnel(id: ConnectionId): Promise<void> {
+  if (!postgresAdapter.tunnelLost(id)) {
+    dismissedTunnelPrompts.delete(id)
+    return
+  }
+  const blocked = () =>
+    new DatabaseConnectionError(
+      'NOT_CONNECTED',
+      'The Teleport tunnel is disconnected. Reconnect it to continue.',
+    )
+  if (dismissedTunnelPrompts.has(id)) throw blocked()
+  if (!tunnelLostPrompt)
+    throw new DatabaseConnectionError(
+      'NOT_CONNECTED',
+      'The Teleport tunnel was lost. Reconnect the connection to continue.',
+    )
+  if (pendingPromptId !== id && pendingPrompt) {
+    // Another connection owns the open prompt; fail this action instead of
+    // stacking a second dialog on top of it.
+    throw blocked()
+  }
+  let pending = pendingPrompt
+  if (!pending) {
+    pendingPromptId = id
+    pending = (async () => {
+      const confirmed = await tunnelLostPrompt(id)
+      if (!confirmed)
+        return { confirmed: false, failure: null as string | null }
+      try {
+        await postgresAdapter.reconnectTunnel(id)
+      } catch (error) {
+        return {
+          confirmed: true,
+          failure:
+            error instanceof Error ? error.message : String(error ?? 'Error'),
+        }
+      }
+      return { confirmed: true, failure: null }
+    })().finally(() => {
+      pendingPrompt = null
+      pendingPromptId = null
+    })
+    pendingPrompt = pending
+  }
+  const answer = await pending
+  if (!answer.confirmed) {
+    dismissedTunnelPrompts.add(id)
+    throw blocked()
+  }
+  if (answer.failure)
+    throw new DatabaseConnectionError('NOT_CONNECTED', answer.failure)
+  if (postgresAdapter.tunnelLost(id)) {
+    dismissedTunnelPrompts.add(id)
+    throw blocked()
+  }
 }
 
 const seriesProbes = new SeriesCardinalityProbes((measurement) => {
@@ -320,7 +346,7 @@ export async function probeSeriesCardinality(
   id: ConnectionId,
   request: unknown,
 ) {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   const active = session(id)
   const result = await seriesProbes.probe(active, request)
   if (session(id) !== active)
@@ -332,7 +358,7 @@ export async function querySeriesStatistics(
   id: ConnectionId,
   request: SeriesStatisticsRequest,
 ) {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   return seriesStatistics(session(id), request)
 }
 
@@ -350,7 +376,7 @@ export async function runQuery(
   prometheus?: Omit<PrometheusQueryRequest, 'expression'>,
   tempo?: TempoQueryRequest,
 ): Promise<QueryResult> {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   const activeSession = session(id)
   // QUERY_RUN predates Tempo and currently exposes the Prometheus range slot through
   // preload. Preserve the shared start/end bounds plus Tempo-only search controls and
@@ -455,7 +481,7 @@ export function formatLokiQuery(
 }
 
 export async function listObjects(id: ConnectionId) {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   return (await session(id).listRelations()).map((relation) => ({
     schema: relation.namespace,
     name: relation.name,
@@ -475,7 +501,7 @@ export async function listObjects(id: ConnectionId) {
 
 /** Refresh discovery owned by a live provider session. This deliberately does not reconnect. */
 export async function refreshMetadata(id: ConnectionId): Promise<void> {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   await session(id).refreshMetadata?.()
 }
 
@@ -484,7 +510,7 @@ export async function describeTable(
   schema: string,
   table: string,
 ) {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   return (
     await session(id).describeRelation({ namespace: schema, name: table })
   ).map((column) => ({
@@ -546,7 +572,7 @@ export async function explainQuery(
   sql: string,
   analyze: boolean,
 ) {
-  await tunnelLostGuard.requireTunnel(id)
+  await requireTunnel(id)
   const explain = session(id).explain
   if (!explain) throw new Error('Explain is not supported by this datasource.')
   return explain(sql, analyze)

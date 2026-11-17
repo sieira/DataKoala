@@ -1,13 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type {
-  ConnectionStateEvent,
-  TeleportPreConnect,
-} from '../shared/types.ts'
+import type { TeleportPreConnect } from '../shared/types.ts'
 import { __tunnelTesting } from './adapters/postgres-adapter.ts'
 import {
   DatabaseConnectionError,
-  onConnectionStateChanged,
   refreshMetadata,
   runQuery,
   setTunnelLostPrompt,
@@ -69,19 +65,5 @@ test('refreshMetadata goes through the same guard, and connected actions never p
   } finally {
     await manager.stopAll()
     setTunnelLostPrompt(null)
-  }
-})
-
-test('tunnel loss reaches the connection state listener only for live sessions', async () => {
-  const manager = __tunnelTesting.sharedTunnels
-  const events: ConnectionStateEvent[] = []
-  onConnectionStateChanged((event) => events.push(event))
-  try {
-    // No live session for this profile: the chip already shows disconnected,
-    // so a tunnel event must not invent state for it.
-    manager.markLostForTest('wiring-events', config)
-    assert.equal(events.length, 0)
-  } finally {
-    await manager.stopAll()
   }
 })

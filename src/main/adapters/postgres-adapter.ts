@@ -39,7 +39,7 @@ const sharedTunnels = new TeleportTunnelManager()
 
 type TunnelManager = Pick<
   TeleportTunnelManager,
-  'start' | 'stop' | 'stopAll' | 'reconnect' | 'state' | 'onStateChanged'
+  'start' | 'stop' | 'stopAll' | 'reconnect' | 'state'
 >
 
 /**
@@ -98,11 +98,7 @@ export class PostgresAdapter implements DataSourceAdapter {
     let tunnelGeneration: number | undefined
     if (preConnect) {
       try {
-        // Connecting is a user-initiated action: a missing or expired
-        // certificate renews itself through `tsh login` (browser).
-        tunnelGeneration = await this.tunnels.start(pgProfile.id, preConnect, {
-          reauthenticate: true,
-        })
+        tunnelGeneration = await this.tunnels.start(pgProfile.id, preConnect)
       } catch (error) {
         return { result: { ok: false as const, error: tunnelReason(error) } }
       }
@@ -187,28 +183,6 @@ export class PostgresAdapter implements DataSourceAdapter {
     listener: Parameters<typeof onPostgresStateChanged>[0],
   ): void {
     onPostgresStateChanged(listener)
-  }
-
-  /**
-   * Tunnel keepalive events that the connection UI should know about: a lost
-   * tunnel means the connection is unusable until the user reconnects, and a
-   * restored tunnel clears that state. The database session is untouched.
-   */
-  onTunnelStateChanged(
-    listener: (event: {
-      profileId: string
-      state: 'lost' | 'ready'
-      message: string
-    }) => void,
-  ): void {
-    this.tunnels.onStateChanged((event) => {
-      if (event.state === 'lost' || event.state === 'ready')
-        listener({
-          profileId: event.profileId,
-          state: event.state,
-          message: event.message,
-        })
-    })
   }
 
   /** True when keepalive detected the drop and the tunnel awaits a user-confirmed reconnect. */
