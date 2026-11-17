@@ -695,14 +695,15 @@ function registerIpc(): void {
   // Keepalive only detects a dropped Teleport tunnel; reconnecting is a user
   // decision. The prompt answers the installed question and the guard performs
   // the reconnect; a failed reconnect surfaces through the failed action.
-  db.setTunnelLostPrompt(async (_id) => {
+  db.setTunnelLostPrompt(async (id) => {
     const win = mainWindow
     if (!win || win.isDestroyed() || isQuitting) return false
+    const profile = await connectionProfiles.get(id).catch(() => undefined)
+    const name = profile?.name ?? id
     const { response } = await dialog.showMessageBox(win, {
       type: 'warning',
       message: 'Teleport tunnel lost',
-      detail:
-        'The Teleport tunnel for this connection dropped. Reconnect it now?',
+      detail: `The Teleport tunnel for "${name}" dropped. Reconnect it now?`,
       buttons: ['Reconnect', 'Cancel'],
       defaultId: 0,
       cancelId: 1,

@@ -212,3 +212,6 @@ export class PostgresAdapter implements DataSourceAdapter {
 }
 
 export { DatabaseConnectionError, __testing } from './postgres.ts'
+
+/** Test seam for db-level tests: the shared tunnel manager behind the adapter. */
+export const __tunnelTesting = { sharedTunnels }

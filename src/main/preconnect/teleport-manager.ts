@@ -337,6 +337,21 @@ export class TeleportTunnelManager {
     }
   }
 
+  /**
+   * Test seam: records a `lost` tunnel for `profileId` without running `tsh`,
+   * so higher-level tests can exercise loss handling end to end.
+   */
+  markLostForTest(profileId: ConnectionId, config: TeleportPreConnect): void {
+    const managed = this.newManagedTunnel(config)
+    this.tunnels.set(profileId, managed)
+    this.setState(
+      managed,
+      profileId,
+      'lost',
+      'The Teleport tunnel stopped. (test seam)',
+    )
+  }
+
   async stop(profileId: ConnectionId, generation?: number): Promise<void> {
     const current = this.tunnels.get(profileId)
     if (generation !== undefined && current?.generation !== generation) {

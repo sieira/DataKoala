@@ -262,6 +262,7 @@ function session(id: ConnectionId): DataSourceSession {
 const tunnelLostGuard = new TunnelLostGuard({
   isLost: (id) => postgresAdapter.tunnelLost(id),
   reconnect: (id) => postgresAdapter.reconnectTunnel(id),
+  failure: (message) => new DatabaseConnectionError('NOT_CONNECTED', message),
 })
 
 export function setTunnelLostPrompt(prompt: TunnelLostPrompt | null): void {
@@ -277,7 +278,7 @@ export async function probeSeriesCardinality(
   id: ConnectionId,
   request: unknown,
 ) {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   const active = session(id)
   const result = await seriesProbes.probe(active, request)
   if (session(id) !== active)
@@ -289,7 +290,7 @@ export async function querySeriesStatistics(
   id: ConnectionId,
   request: SeriesStatisticsRequest,
 ) {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   return seriesStatistics(session(id), request)
 }
 
@@ -307,7 +308,7 @@ export async function runQuery(
   prometheus?: Omit<PrometheusQueryRequest, 'expression'>,
   tempo?: TempoQueryRequest,
 ): Promise<QueryResult> {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   const activeSession = session(id)
   // QUERY_RUN predates Tempo and currently exposes the Prometheus range slot through
   // preload. Preserve the shared start/end bounds plus Tempo-only search controls and
@@ -412,7 +413,7 @@ export function formatLokiQuery(
 }
 
 export async function listObjects(id: ConnectionId) {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   return (await session(id).listRelations()).map((relation) => ({
     schema: relation.namespace,
     name: relation.name,
@@ -432,7 +433,7 @@ export async function listObjects(id: ConnectionId) {
 
 /** Refresh discovery owned by a live provider session. This deliberately does not reconnect. */
 export async function refreshMetadata(id: ConnectionId): Promise<void> {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   await session(id).refreshMetadata?.()
 }
 
@@ -441,7 +442,7 @@ export async function describeTable(
   schema: string,
   table: string,
 ) {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   return (
     await session(id).describeRelation({ namespace: schema, name: table })
   ).map((column) => ({
@@ -503,7 +504,7 @@ export async function explainQuery(
   sql: string,
   analyze: boolean,
 ) {
-  await tunnelLostGuard.ensure(id)
+  await tunnelLostGuard.requireTunnel(id)
   const explain = session(id).explain
   if (!explain) throw new Error('Explain is not supported by this datasource.')
   return explain(sql, analyze)

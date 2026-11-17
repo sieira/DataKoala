@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { DatabaseConnectionError } from './adapters/postgres.ts'
 import { TunnelLostGuard } from './tunnel-lost-guard.ts'
 
 interface Harness {
@@ -18,32 +17,30 @@ function harness(): Harness {
       reconnects.push(id)
       lost.delete(id)
     },
+    failure: (message) => new Error(message),
   })
   return { guard, lost, reconnects }
 }
 
-test('ensure passes through when the tunnel is not lost', async () => {
+test('requireTunnel passes through when the tunnel is not lost', async () => {
   const { guard } = harness()
   guard.setPrompt(async () => {
     throw new Error('the prompt must not be shown')
   })
-  await guard.ensure('p1')
+  await guard.requireTunnel('p1')
 })
 
-test('ensure without an installed prompt fails with an actionable error', async () => {
+test('requireTunnel without an installed prompt fails with an actionable error', async () => {
   const { guard, lost } = harness()
   lost.add('p1')
   guard.setPrompt(null)
   await assert.rejects(
-    guard.ensure('p1'),
-    (error: unknown) =>
-      error instanceof DatabaseConnectionError &&
-      error.code === 'NOT_CONNECTED' &&
-      /Reconnect the connection/.test(error.message),
+    guard.requireTunnel('p1'),
+    /Reconnect the connection to continue/,
   )
 })
 
-test('ensure prompts once, reconnects on confirmation, and the action proceeds', async () => {
+test('requireTunnel prompts once, reconnects on confirmation, and the action proceeds', async () => {
   const { guard, lost, reconnects } = harness()
   lost.add('p1')
   let prompts = 0
@@ -53,14 +50,35 @@ test('ensure prompts once, reconnects on confirmation, and the action proceeds',
     return true
   })
 
-  // Concurrent actions share one dialog and one reconnect attempt.
-  await Promise.all([guard.ensure('p1'), guard.ensure('p1')])
+  // Concurrent actions on the same connection share one prompt and one
+  // reconnect attempt.
+  await Promise.all([guard.requireTunnel('p1'), guard.requireTunnel('p1')])
   assert.equal(prompts, 1)
   assert.deepEqual(reconnects, ['p1'])
   assert.equal(lost.has('p1'), false)
 
-  await guard.ensure('p1')
+  await guard.requireTunnel('p1')
   assert.equal(prompts, 1)
+})
+
+test('a second lost connection queues its own dialog instead of joining the first', async () => {
+  const { guard, lost, reconnects } = harness()
+  lost.add('a')
+  lost.add('b')
+  const prompts: string[] = []
+  guard.setPrompt(async (id) => {
+    prompts.push(id)
+    return true
+  })
+
+  const first = guard.requireTunnel('a')
+  const second = guard.requireTunnel('b')
+  await Promise.all([first, second])
+
+  assert.deepEqual(prompts, ['a', 'b'])
+  assert.deepEqual(reconnects, ['a', 'b'])
+  assert.equal(lost.has('a'), false)
+  assert.equal(lost.has('b'), false)
 })
 
 test('cancelling the prompt fails the action without reconnecting', async () => {
@@ -72,11 +90,8 @@ test('cancelling the prompt fails the action without reconnecting', async () => 
     return false
   })
   await assert.rejects(
-    guard.ensure('p1'),
-    (error: unknown) =>
-      error instanceof DatabaseConnectionError &&
-      error.code === 'NOT_CONNECTED' &&
-      /disconnected/.test(error.message),
+    guard.requireTunnel('p1'),
+    /The Teleport tunnel is disconnected/,
   )
   assert.equal(prompts, 1)
   assert.deepEqual(reconnects, [])
@@ -92,14 +107,12 @@ test('a failed reconnect keeps the action blocked and surfaces the reason', asyn
         'Your Teleport session has expired. Run "tsh login", then try again.',
       )
     },
+    failure: (message) => new Error(message),
   })
   guardThatCannotReconnect.setPrompt(async () => true)
   await assert.rejects(
-    guardThatCannotReconnect.ensure('p1'),
-    (error: unknown) =>
-      error instanceof DatabaseConnectionError &&
-      error.code === 'NOT_CONNECTED' &&
-      /tsh login/.test(error.message),
+    guardThatCannotReconnect.requireTunnel('p1'),
+    /tsh login/,
   )
 })
 
@@ -108,12 +121,30 @@ test('a reconnect that leaves the tunnel lost keeps the action blocked', async (
   const guard = new TunnelLostGuard({
     isLost: () => true,
     reconnect: async () => {},
+    failure: (message) => new Error(message),
   })
   guard.setPrompt(async () => true)
   await assert.rejects(
-    guard.ensure('p1'),
-    (error: unknown) =>
-      error instanceof DatabaseConnectionError &&
-      /disconnected/.test(error.message),
+    guard.requireTunnel('p1'),
+    /The Teleport tunnel is disconnected/,
   )
+})
+
+test('a rejected prompt fails the action with a typed error carrying the reason', async () => {
+  const reconnects: string[] = []
+  const guard = new TunnelLostGuard({
+    isLost: () => true,
+    reconnect: async (id) => {
+      reconnects.push(id)
+    },
+    failure: (message) => new Error(message),
+  })
+  guard.setPrompt(async () => {
+    throw new Error('the dialog window was destroyed')
+  })
+  await assert.rejects(
+    guard.requireTunnel('p1'),
+    /the dialog window was destroyed/,
+  )
+  assert.deepEqual(reconnects, [])
 })

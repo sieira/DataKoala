@@ -48,6 +48,17 @@ username, cluster, roles}`. This is the login check; it never opens a browser.
 | Secrets     | None stored; Teleport auth is out-of-band via `tsh login`           |
 | Binary      | `tsh` from PATH, with an optional absolute-path override            |
 
+## Domain terms
+
+- **Tunnel**: the local `tsh proxy db --tunnel` process opened for one saved
+  profile. DataKoala's word for the Teleport database access path.
+- **Keepalive**: the watch on a ready tunnel (process exit, TCP health check).
+  Keepalive detects drops; it never restarts anything.
+- **Lost**: the tunnel dropped and waits for the user. The `lost` state keeps
+  the tunnel config so a reconnect stays possible.
+- **Reconnect**: the user-confirmed restart of a lost tunnel, keeping the
+  tunnel's generation.
+
 ## Data model
 
 `PostgresProfile.preConnect?: TeleportPreConnect` in `src/shared/types.ts`
