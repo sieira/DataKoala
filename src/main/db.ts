@@ -152,6 +152,11 @@ export class SessionManager {
     return this.sessions.get(id)?.session
   }
 
+  /** The live session's generation, or undefined when nothing is connected. */
+  generationOf(id: ConnectionId): number | undefined {
+    return this.sessions.get(id)?.result.generation
+  }
+
   listLive(): Array<{
     id: ConnectionId
     generation: number
@@ -199,6 +204,43 @@ export function onConnectionStateChanged(
     if (event.state === 'failed' || event.state === 'disconnected')
       sessionManager.forget(event.profileId, event.generation)
     listener(event)
+  })
+  // Tunnel keepalive reaches the UI as connection state: a lost tunnel marks
+  // the connection errored (the session survives so a confirmed reconnect
+  // just works), and a restored tunnel clears the error. Test tunnels and
+  // profiles without a live session are ignored — the chip already shows
+  // disconnected for those.
+  const tunnelLostProfiles = new Set<ConnectionId>()
+  postgresAdapter.onTunnelStateChanged((tunnel) => {
+    const generation = sessionManager.generationOf(tunnel.profileId)
+    if (generation === undefined) return
+    if (tunnel.state === 'lost') {
+      tunnelLostProfiles.add(tunnel.profileId)
+      listener({
+        profileId: tunnel.profileId,
+        state: 'lost',
+        expected: false,
+        message: tunnel.message,
+        code: 'CONNECTION_LOST',
+        generation,
+        timestamp: Date.now(),
+        recoverable: true,
+        source: 'teleport-tunnel',
+      })
+      return
+    }
+    if (tunnelLostProfiles.delete(tunnel.profileId))
+      listener({
+        profileId: tunnel.profileId,
+        state: 'connected',
+        expected: true,
+        message: '',
+        code: null,
+        generation,
+        timestamp: Date.now(),
+        recoverable: true,
+        source: 'teleport-tunnel',
+      })
   })
 }
 

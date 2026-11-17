@@ -24,6 +24,7 @@ export function TunnelLostDialog({
       onClose={() => onAnswer(request.requestId, false)}
       labelledBy={titleId}
       describedBy={descriptionId}
+      dialogClassName={styles.dialog}
     >
       <h2 id={titleId}>Teleport tunnel lost</h2>
       <p id={descriptionId}>

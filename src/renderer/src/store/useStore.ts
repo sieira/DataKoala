@@ -541,7 +541,7 @@ export const useStore = create<AppState>((set, get) => ({
       const metadata =
         state.metadataByProfileId[event.profileId] ?? emptyMetadata()
       const status: ConnectionStatus =
-        event.state === 'failed'
+        event.state === 'failed' || event.state === 'lost'
           ? 'error'
           : event.state === 'disconnecting'
             ? 'disconnected'
@@ -550,7 +550,10 @@ export const useStore = create<AppState>((set, get) => ({
         status,
         generation: event.generation,
         error:
-          event.state === 'failed' && !event.expected ? event.message : null,
+          (event.state === 'failed' || event.state === 'lost') &&
+          !event.expected
+            ? event.message
+            : null,
         serverVersion: previousConnection?.serverVersion ?? null,
       }
       const scoped = {

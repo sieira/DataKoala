@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { PostgresProfile } from '../../shared/types.ts'
+import type { PreConnectStateEvent } from '../preconnect/teleport-manager.ts'
 import { PostgresAdapter, testTunnelKey } from './postgres-adapter.ts'
 
 class FakeTunnels {
@@ -11,6 +12,28 @@ class FakeTunnels {
   stops: Array<{ id: string; generation?: number }> = []
   lost: Set<string> = new Set()
   reconnects: string[] = []
+  stateListeners = new Set<(event: PreConnectStateEvent) => void>()
+
+  emitState(event: {
+    profileId: string
+    state: 'lost' | 'ready' | 'starting'
+    message: string
+  }): void {
+    for (const listener of this.stateListeners)
+      listener({
+        profileId: event.profileId,
+        state: event.state,
+        message: event.message,
+        code: null,
+        generation: 1,
+        timestamp: 0,
+      })
+  }
+
+  onStateChanged(listener: (event: PreConnectStateEvent) => void): () => void {
+    this.stateListeners.add(listener)
+    return () => this.stateListeners.delete(listener)
+  }
 
   async start(
     id: string,
@@ -112,4 +135,32 @@ test('tunnelLost and reconnectTunnel delegate to the manager state', async () =>
   await adapter.reconnectTunnel('p1')
   assert.deepEqual(tunnels.reconnects, ['p1'])
   assert.equal(adapter.tunnelLost('p1'), false)
+})
+
+test('tunnel state events surface only loss and readiness to the UI', async () => {
+  const tunnels = new FakeTunnels()
+  const adapter = new PostgresAdapter(tunnels)
+  const seen: Array<{ profileId: string; state: 'lost' | 'ready' }> = []
+  adapter.onTunnelStateChanged((event) => seen.push(event))
+
+  tunnels.emitState({
+    profileId: 'p1',
+    state: 'starting',
+    message: 'starting tunnel',
+  })
+  tunnels.emitState({
+    profileId: 'p1',
+    state: 'lost',
+    message: 'The Teleport tunnel stopped.',
+  })
+  tunnels.emitState({
+    profileId: 'p1',
+    state: 'ready',
+    message: 'Teleport tunnel ready.',
+  })
+
+  assert.deepEqual(seen, [
+    { profileId: 'p1', state: 'lost', message: 'The Teleport tunnel stopped.' },
+    { profileId: 'p1', state: 'ready', message: 'Teleport tunnel ready.' },
+  ])
 })
