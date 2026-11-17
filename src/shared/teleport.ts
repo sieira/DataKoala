@@ -70,6 +70,18 @@ export function formatProxyDbCommand(
 }
 
 /**
+ * Builds the argv for `tsh login`, used only when the user has explicitly
+ * asked to reconnect and the certificate is missing or expired. Without a
+ * stored proxy the user's default `tsh` configuration is used.
+ */
+export function buildLoginArgs(config: TeleportPreConnect): string[] {
+  const args = ['login']
+  if (config.proxy?.trim()) args.push(`--proxy=${config.proxy.trim()}`)
+  if (config.login?.trim()) args.push(`--user=${config.login.trim()}`)
+  return args
+}
+
+/**
  * Parses `tsh status --format=json`. A missing `active` section means the user
  * has no live certificate, which is the case the UI must call out explicitly.
  */

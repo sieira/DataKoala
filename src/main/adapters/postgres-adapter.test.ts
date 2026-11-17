@@ -4,13 +4,20 @@ import type { PostgresProfile } from '../../shared/types.ts'
 import { PostgresAdapter, testTunnelKey } from './postgres-adapter.ts'
 
 class FakeTunnels {
-  starts: string[] = []
+  starts: Array<{
+    id: string
+    options?: { reauthenticate?: boolean }
+  }> = []
   stops: Array<{ id: string; generation?: number }> = []
   lost: Set<string> = new Set()
   reconnects: string[] = []
 
-  async start(id: string): Promise<number> {
-    this.starts.push(id)
+  async start(
+    id: string,
+    _config?: unknown,
+    options?: { reauthenticate?: boolean },
+  ): Promise<number> {
+    this.starts.push({ id, options })
     this.lost.delete(id)
     return 42
   }
@@ -61,12 +68,28 @@ test('test uses a throwaway tunnel key so a live connection is untouched', async
   await adapter.test(profile())
 
   assert.equal(testTunnelKey('p1'), 'p1::test')
-  assert.deepEqual(tunnels.starts, ['p1::test'])
+  assert.deepEqual(
+    tunnels.starts.map((start) => start.id),
+    ['p1::test'],
+  )
   assert.deepEqual(tunnels.stops, [{ id: 'p1::test', generation: 42 }])
   assert.ok(
-    !tunnels.starts.includes('p1') && !tunnels.stops.some((s) => s.id === 'p1'),
+    !tunnels.starts.some((start) => start.id === 'p1') &&
+      !tunnels.stops.some((stop) => stop.id === 'p1'),
     'the live profile key must never be started or stopped',
   )
+})
+
+test('connecting opts into re-authentication; testing does not', async () => {
+  const tunnels = new FakeTunnels()
+  const adapter = new PostgresAdapter(tunnels)
+
+  await adapter.test(profile())
+  assert.equal(tunnels.starts[0]?.options?.reauthenticate, undefined)
+
+  await adapter.connect(profile())
+  assert.equal(tunnels.starts[1]?.id, 'p1')
+  assert.equal(tunnels.starts[1]?.options?.reauthenticate, true)
 })
 
 test('test without a tunnel never touches the tunnel manager', async () => {

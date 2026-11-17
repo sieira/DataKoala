@@ -98,7 +98,11 @@ export class PostgresAdapter implements DataSourceAdapter {
     let tunnelGeneration: number | undefined
     if (preConnect) {
       try {
-        tunnelGeneration = await this.tunnels.start(pgProfile.id, preConnect)
+        // Connecting is a user-initiated action: a missing or expired
+        // certificate renews itself through `tsh login` (browser).
+        tunnelGeneration = await this.tunnels.start(pgProfile.id, preConnect, {
+          reauthenticate: true,
+        })
       } catch (error) {
         return { result: { ok: false as const, error: tunnelReason(error) } }
       }

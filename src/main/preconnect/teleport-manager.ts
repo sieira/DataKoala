@@ -8,6 +8,7 @@ import {
 } from './errors.ts'
 import {
   DEFAULT_TUNNEL_HOST,
+  buildLoginArgs,
   buildProxyDbArgs,
   isSessionExpired,
   isValidTunnelPort,
@@ -25,6 +26,7 @@ import {
 export type PreConnectState =
   | 'checking-tsh'
   | 'checking-login'
+  | 'reauthenticating'
   | 'starting'
   | 'waiting-for-port'
   | 'ready'
@@ -70,6 +72,16 @@ export interface TeleportDeps {
     env: NodeJS.ProcessEnv,
     signal: AbortSignal,
   ): Promise<TshStatus>
+  /**
+   * Runs `tsh login` so the certificate renews in the user's browser. Only
+   * reachable from flows the user explicitly confirmed (connect, reconnect).
+   */
+  login(
+    binary: string,
+    args: string[],
+    env: NodeJS.ProcessEnv,
+    signal: AbortSignal,
+  ): Promise<void>
   waitForPort(
     port: number,
     timeoutMs: number,
@@ -198,12 +210,43 @@ async function defaultCheckStatus(
   })
 }
 
+const LOGIN_TIMEOUT_MS = 180_000
+
+async function defaultLogin(
+  binary: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    execFile(
+      binary,
+      args,
+      { env, timeout: LOGIN_TIMEOUT_MS, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = summarizeTshFailure(stderr ?? '', stdout ?? '')
+          reject(
+            new PreConnectError(
+              'TSH_NOT_LOGGED_IN',
+              detail ||
+                `Teleport authentication did not complete: ${messageOf(error)}`,
+            ),
+          )
+          return
+        }
+        resolve()
+      },
+    )
+  })
+}
+
 export function createTeleportDeps(
   overrides: Partial<TeleportDeps> = {},
 ): TeleportDeps {
   return {
     spawnTsh: defaultSpawnTsh,
     checkStatus: defaultCheckStatus,
+    login: defaultLogin,
     waitForPort: (port, timeoutMs, signal) =>
       waitForPort({
         host: DEFAULT_TUNNEL_HOST,
@@ -260,10 +303,15 @@ export class TeleportTunnelManager {
    * Starts (or restarts) a tunnel and resolves to its generation once it is
    * accepting connections. The caller passes that generation back to `stop` so a
    * superseded attempt cannot close a newer tunnel that shares the profile id.
+   *
+   * `reauthenticate` marks a user-initiated flow: when the Teleport certificate
+   * is missing or expired, the manager runs `tsh login`, which renews it in the
+   * user's browser. Keepalive never reaches here with that intent.
    */
   async start(
     profileId: ConnectionId,
     config: TeleportPreConnect,
+    options: { reauthenticate?: boolean } = {},
   ): Promise<number> {
     const intent = ++this.nextIntent
     this.intents.set(profileId, intent)
@@ -282,8 +330,7 @@ export class TeleportTunnelManager {
     )
 
     try {
-      await this.verifyLogin(managed, profileId, intent)
-      await this.launch(managed, profileId, intent)
+      await this.openTunnel(managed, profileId, intent, options)
     } catch (error) {
       if (error instanceof SupersededError) throw error
       await this.fail(managed, profileId, error)
@@ -296,7 +343,8 @@ export class TeleportTunnelManager {
    * Restores a tunnel that entered the `lost` state, keeping its generation so
    * a caller holding the original one can still stop the restored tunnel. A
    * failed reconnect keeps the tunnel lost (with the failure surfaced in the
-   * state event) so the user can retry — for example after running `tsh login`.
+   * state event) so the user can retry. Reconnecting is always user-confirmed,
+   * so it may renew the certificate through `tsh login`.
    */
   async reconnect(profileId: ConnectionId): Promise<void> {
     const managed = this.tunnels.get(profileId)
@@ -304,10 +352,9 @@ export class TeleportTunnelManager {
     const intent = ++this.nextIntent
     this.intents.set(profileId, intent)
     try {
-      // A dropped tunnel is often an expired certificate; re-checking login turns
-      // a cryptic failure into an actionable "run tsh login" message.
-      await this.verifyLogin(managed, profileId, intent)
-      await this.launch(managed, profileId, intent)
+      await this.openTunnel(managed, profileId, intent, {
+        reauthenticate: true,
+      })
     } catch (error) {
       if (error instanceof SupersededError) throw error
       await this.terminate(managed)
@@ -322,6 +369,52 @@ export class TeleportTunnelManager {
       )
       throw error
     }
+  }
+
+  private async openTunnel(
+    managed: ManagedTunnel,
+    profileId: ConnectionId,
+    intent: number,
+    options: { reauthenticate?: boolean },
+  ): Promise<void> {
+    try {
+      // A dropped tunnel is often an expired certificate; re-checking login
+      // turns a cryptic failure into an actionable message.
+      await this.verifyLogin(managed, profileId, intent)
+      await this.launch(managed, profileId, intent)
+    } catch (error) {
+      const canReauthenticate =
+        options.reauthenticate === true &&
+        error instanceof PreConnectError &&
+        error.code === 'TSH_NOT_LOGGED_IN'
+      if (!canReauthenticate) throw error
+      // The user asked for this tunnel, so renew the certificate openly in
+      // their browser instead of telling them to run `tsh login` themselves.
+      await this.reauthenticate(managed, profileId, intent)
+      await this.verifyLogin(managed, profileId, intent)
+      await this.launch(managed, profileId, intent)
+    }
+  }
+
+  private async reauthenticate(
+    managed: ManagedTunnel,
+    profileId: ConnectionId,
+    intent: number,
+  ): Promise<void> {
+    this.ensureCurrent(profileId, managed, intent)
+    this.setState(
+      managed,
+      profileId,
+      'reauthenticating',
+      'Opening Teleport authentication in your browser…',
+    )
+    await this.deps.login(
+      resolveTshBinary(managed.config),
+      buildLoginArgs(managed.config),
+      this.env(),
+      managed.abort.signal,
+    )
+    this.ensureCurrent(profileId, managed, intent)
   }
 
   private newManagedTunnel(config: TeleportPreConnect): ManagedTunnel {

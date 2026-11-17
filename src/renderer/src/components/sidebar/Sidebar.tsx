@@ -721,7 +721,7 @@ export function Sidebar() {
       <AiSettingsAction />
       {!tabConnected && activeTabConnection?.error && (
         <div className={styles.objectError} role="alert">
-          {activeTabConnection.error}
+          {activeTabConnection.error}{' '}
           <button
             onClick={() => void ensureConnectionForTab(activeTabId)}
             disabled={activeTabConnecting}

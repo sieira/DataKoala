@@ -82,13 +82,22 @@ interface Harness {
   manager: TeleportTunnelManager
   children: FakeChild[]
   events: PreConnectStateEvent[]
+  logins: Array<{ binary: string; args: string[] }>
 }
 
-function harness(overrides: Partial<TeleportDeps> = {}): Harness {
+function harness(
+  overrides: Partial<TeleportDeps> = {},
+  onLogin: () => void = () => {},
+): Harness {
   const children: FakeChild[] = []
   const events: PreConnectStateEvent[] = []
+  const logins: Array<{ binary: string; args: string[] }> = []
   const manager = new TeleportTunnelManager({
     checkStatus: async () => ({ loggedIn: true, roles: [] }),
+    login: async (binary, args) => {
+      logins.push({ binary, args })
+      onLogin()
+    },
     spawnTsh: () => {
       const child = new FakeChild()
       children.push(child)
@@ -102,7 +111,7 @@ function harness(overrides: Partial<TeleportDeps> = {}): Harness {
     ...overrides,
   })
   manager.onStateChanged((event) => events.push(event))
-  return { manager, children, events }
+  return { manager, children, events, logins }
 }
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -218,40 +227,120 @@ test('keepalive marks the tunnel lost after an unexpected exit and reconnect res
   await manager.stopAll()
 })
 
-test('reconnect re-checks the Teleport login and keeps the tunnel lost on failure', async () => {
-  let sessionActive = true
-  const { manager, children } = harness({
-    checkStatus: async () => {
-      if (sessionActive) return { loggedIn: true, roles: [] }
-      return {
-        loggedIn: true,
-        roles: [],
-        validUntil: '2020-01-01T00:00:00Z',
-      }
+test('a user-initiated start renews an expired session through tsh login', async () => {
+  let sessionActive = false
+  const { manager, children, events, logins } = harness(
+    {
+      checkStatus: async () =>
+        sessionActive
+          ? { loggedIn: true, roles: [] }
+          : { loggedIn: true, roles: [], validUntil: '2020-01-01T00:00:00Z' },
+      now: () => Date.parse('2026-01-01T00:00:00Z'),
     },
+    () => {
+      sessionActive = true
+    },
+  )
+
+  await manager.start('p1', config(), { reauthenticate: true })
+
+  assert.deepEqual(logins, [{ binary: 'tsh', args: ['login'] }])
+  assert.equal(children.length, 1)
+  assert.equal(manager.isReady('p1'), true)
+  assert.ok(events.some((event) => event.state === 'reauthenticating'))
+  await manager.stopAll()
+})
+
+test('a plain start still fails fast without opening authentication', async () => {
+  const { manager, children, logins } = harness({
+    checkStatus: async () => ({
+      loggedIn: true,
+      roles: [],
+      validUntil: '2020-01-01T00:00:00Z',
+    }),
     now: () => Date.parse('2026-01-01T00:00:00Z'),
   })
+  await assert.rejects(
+    manager.start('p1', config()),
+    (error: unknown) =>
+      error instanceof PreConnectError &&
+      error.code === 'TSH_NOT_LOGGED_IN' &&
+      /expired/i.test(error.message),
+  )
+  assert.equal(logins.length, 0)
+  assert.equal(children.length, 0)
+})
+
+test('reconnect renews an expired session through tsh login and restores the tunnel', async () => {
+  let sessionActive = true
+  const { manager, children, events, logins } = harness(
+    {
+      checkStatus: async () => {
+        if (sessionActive) return { loggedIn: true, roles: [] }
+        return {
+          loggedIn: true,
+          roles: [],
+          validUntil: '2020-01-01T00:00:00Z',
+        }
+      },
+      now: () => Date.parse('2026-01-01T00:00:00Z'),
+    },
+    () => {
+      sessionActive = true
+    },
+  )
   await manager.start('p1', config())
   children[0].emitExit(1, null)
   await wait(10)
   assert.equal(manager.state('p1'), 'lost')
 
   sessionActive = false
+  await manager.reconnect('p1')
+
+  assert.equal(logins.length, 1)
+  assert.equal(children.length, 2)
+  assert.equal(manager.isReady('p1'), true)
+  assert.ok(events.some((event) => event.state === 'reauthenticating'))
+  await manager.stopAll()
+})
+
+test('a failed re-login keeps the tunnel lost and surfaces the reason', async () => {
+  let sessionActive = true
+  const { manager, children, logins } = harness(
+    {
+      checkStatus: async () => {
+        if (sessionActive) return { loggedIn: true, roles: [] }
+        return {
+          loggedIn: true,
+          roles: [],
+          validUntil: '2020-01-01T00:00:00Z',
+        }
+      },
+      now: () => Date.parse('2026-01-01T00:00:00Z'),
+    },
+    () => {
+      throw new PreConnectError(
+        'TSH_NOT_LOGGED_IN',
+        'Teleport authentication did not complete.',
+      )
+    },
+  )
+  await manager.start('p1', config())
+  sessionActive = false
+  children[0].emitExit(1, null)
+  await wait(10)
+  assert.equal(manager.state('p1'), 'lost')
+
   await assert.rejects(
     manager.reconnect('p1'),
     (error: unknown) =>
       error instanceof PreConnectError &&
       error.code === 'TSH_NOT_LOGGED_IN' &&
-      /expired/i.test(error.message),
+      /did not complete/.test(error.message),
   )
+  assert.equal(logins.length, 1)
   assert.equal(children.length, 1)
   assert.equal(manager.state('p1'), 'lost')
-
-  // Once the user has re-authenticated, a retry succeeds.
-  sessionActive = true
-  await manager.reconnect('p1')
-  assert.equal(children.length, 2)
-  assert.equal(manager.isReady('p1'), true)
   await manager.stopAll()
 })
 

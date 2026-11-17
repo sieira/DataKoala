@@ -35,18 +35,18 @@ username, cluster, roles}`. This is the login check; it never opens a browser.
 
 ## Decisions
 
-| Topic       | Decision                                                            |
-| ----------- | ------------------------------------------------------------------- |
-| Scope       | PostgreSQL only                                                     |
-| Config      | Structured Teleport settings, not a free-form shell string          |
-| Execution   | `spawn(binary, argv)` with no shell; values are discrete argv items |
-| Mode        | Always `tsh proxy db --tunnel`                                      |
-| Readiness   | Poll `127.0.0.1:<tunnelPort>` until it accepts, or time out         |
-| Auth        | Check `tsh status` first; never run `tsh login` for the user        |
-| Keepalive   | Detect drops; reconnect only after user confirmation                |
-| Pool target | Derived `127.0.0.1:<tunnelPort>`; TLS disabled; no password         |
-| Secrets     | None stored; Teleport auth is out-of-band via `tsh login`           |
-| Binary      | `tsh` from PATH, with an optional absolute-path override            |
+| Topic       | Decision                                                                                                       |
+| ----------- | -------------------------------------------------------------------------------------------------------------- |
+| Scope       | PostgreSQL only                                                                                                |
+| Config      | Structured Teleport settings, not a free-form shell string                                                     |
+| Execution   | `spawn(binary, argv)` with no shell; values are discrete argv items                                            |
+| Mode        | Always `tsh proxy db --tunnel`                                                                                 |
+| Readiness   | Poll `127.0.0.1:<tunnelPort>` until it accepts, or time out                                                    |
+| Auth        | Check `tsh status` first; user-initiated connect/reconnect may run `tsh login` (browser); keepalive never does |
+| Keepalive   | Detect drops; reconnect only after user confirmation                                                           |
+| Pool target | Derived `127.0.0.1:<tunnelPort>`; TLS disabled; no password                                                    |
+| Secrets     | None stored; Teleport auth is out-of-band via `tsh login`                                                      |
+| Binary      | `tsh` from PATH, with an optional absolute-path override                                                       |
 
 ## Domain terms
 
@@ -58,6 +58,9 @@ username, cluster, roles}`. This is the login check; it never opens a browser.
   the tunnel config so a reconnect stays possible.
 - **Reconnect**: the user-confirmed restart of a lost tunnel, keeping the
   tunnel's generation.
+- **Reauthenticate**: the `tsh login` run on a user-initiated connect or
+  reconnect when the certificate is missing or expired; it renews the
+  certificate in the user's browser.
 
 ## Data model
 
@@ -114,12 +117,16 @@ the tunnel is enabled. `user` and `database` are shared, so they stay required.
 
 ```
 checking-tsh → checking-login → starting → waiting-for-port → ready
-                                                     ↘ lost (user-confirmed reconnect → checking-login …)
+        ↘ reauthenticating → checking-login          ↘ lost (user-confirmed reconnect → checking-login …)
 stopped / failed
 ```
 
 - **checking-login**: `tsh status --format=json`; no `active` section →
-  `TSH_NOT_LOGGED_IN` ("Run tsh login, then try again").
+  `TSH_NOT_LOGGED_IN` ("Run tsh login, then try again"). On a user-initiated
+  connect or reconnect, that failure runs `tsh login` once: the certificate
+  renews in the user's browser and the start continues.
+- **reauthenticating**: `tsh login` is running and the user completes
+  authentication in their browser (bounded by a 180 s timeout).
 - **starting / waiting-for-port**: spawn detached (own process group) and poll
   the port. An early process exit fails the start with the sanitised stderr.
 - **ready**: if keepalive is on, a TCP health-check runs on an interval. Two
@@ -128,11 +135,12 @@ stopped / failed
   never respawned in the background because relaunching `tsh` can trigger a
   Teleport re-auth flow (a browser tab) with no user action. The next query or
   metadata action raises a native "Teleport tunnel lost — Reconnect?" dialog
-  (`TunnelLostGuard`); on confirmation the manager re-checks `tsh status` (so an
-  expired certificate surfaces as "run tsh login") and relaunches the tunnel
-  with the same generation, so the original action then simply proceeds. On
-  cancel, or after a failed reconnect, the action fails with a typed
-  "not connected" error and the tunnel stays lost for a later retry.
+  (`TunnelLostGuard`); on confirmation the manager re-checks `tsh status` and,
+  if the certificate is missing or expired, runs `tsh login` (the browser
+  re-auth the user just confirmed), then relaunches the tunnel with the same
+  generation, so the original action then simply proceeds. On cancel, or after
+  a failed reconnect, the action fails with a typed "not connected" error and
+  the tunnel stays lost for a later retry.
 - **stop**: SIGTERM the process group, then SIGKILL after a grace period.
 
 Generation/intent guards (mirroring `postgres.ts`) ensure a superseded connect
